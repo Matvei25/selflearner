@@ -1,4 +1,4 @@
-;;; МАРК v0.3 — чат-интерфейс (мозг в core.lisp)
+;;; МАРК v0.5 — чат-интерфейс (мозг в core.lisp)
 ;;; Запуск: ./run.sh
 ;;; Вид диалога: юзер: ... / марк: ...
 
@@ -9,7 +9,7 @@
 (load-macros)
 (load-codes)
 
-(format t "марк v0.3 — учусь сам. !help — инструменты.~%")
+(format t "марк v0.5 — учусь сам. !help — инструменты.~%")
 
 (loop for line = (read-line *standard-input* nil nil) while line do
   (let ((l (string-trim '(#\Newline #\Space) line)))

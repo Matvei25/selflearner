@@ -85,7 +85,10 @@
       (unless (string-equal (first entry) (second entry))
         (let* ((mw (words (first entry)))
                (score (length (intersection qw (or mw (words-all (first entry))) :test #'string=))))
-          (when (> score best-score)
+          ;; v0.5: при равном совпадении побеждает БОЛЕЕ уверенная запись
+          (when (or (> score best-score)
+                    (and (= score best-score) (>= best-score 1)
+                         (> (fourth entry) (fourth best))))
             (setf best entry best-score score)))))
     (when (and best (>= best-score 1)) best)))
 
@@ -104,7 +107,51 @@
         (before (length *memory*)))
     (setf *memory* (remove-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))
     (save-memory)
-    (format t "забыл ~a записей~%" (- before (length *memory*)))))
+    (format t "забыл ~a записей~%"
+            (- before (length *memory*)))))
+
+;; ---------- v0.5: обратная связь + / - ----------
+
+(defvar *praise-count* 0)
+(defvar *critic-count* 0)
+
+(defun current-entry ()
+  "найти запись, которую марк использовал последней (по *last-q*)"
+  (when *last-q*
+    (let ((norm (normalize *last-q*)))
+      (find-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))))
+
+(defun praise ()
+  "плюс: ответ сработал — закрепить запись (уверенность -> 1.0)"
+  (let ((entry (current-entry)))
+    (cond
+      ((null entry)
+       (format t "нечего хвалить — сначала дождись ответа~%"))
+      (t
+       (setf (fourth entry) 1.0)
+       (incf *praise-count*)
+       (save-memory)
+       (format t "👍 запомнил, что сработало: ~a => ~a [точно]~%"
+               (first entry) (second entry))))))
+
+(defun criticize ()
+  "минус: ответ не сработал — понизить уверенность; слабые записи удаляются"
+  (let ((entry (current-entry)))
+    (cond
+      ((null entry)
+       (format t "нечего ругать — сначала дождись ответа~%"))
+      ((<= (or (fourth entry) 0.0) 0.4)
+       ;; догадка не сработала — выбрасываем совсем
+       (let ((q (first entry)))
+         (forget q)
+         (incf *critic-count*)
+         (format t "👎 выбросил догадку: ~a~%" q)))
+      (t
+       (setf (fourth entry) 0.2)
+       (incf *critic-count*)
+       (save-memory)
+       (format t "👎 понизил уверенность: ~a => ~a [догадка]~%"
+               (first entry) (second entry))))))
 
 (defun improvise (&optional (seed "ага"))
   "сгенерировать текст марковской цепью (с температурой)"
@@ -128,7 +175,10 @@
     (format t "приснилось: почистил ~a, осталось ~a~%" (- before (length *memory*)) (length *memory*))))
 
 (defun stats ()
-  (format t "знаю пар: ~a (из них догадок: ~a)~%" (length *memory*) *guess-count*))
+  (let ((guesses (count-if (lambda (e) (< (or (fourth e) 0.0) 0.9)) *memory*)))
+    (format t "знаю пар: ~a (из них слабых: ~a)~%" (length *memory*) guesses)
+    (format t "догадок за сессию: ~a · оценок: ~a 👍 / ~a 👎~%"
+            *guess-count* *praise-count* *critic-count*)))
 
 (defun show-memory ()
   (if (null *memory*)
@@ -172,10 +222,11 @@
     ("help"      "справка по инструментам"                   help)))
 
 (defun help ()
-  (format t "марк v0.3 — инструменты (вызывай как в лиспе: (имя ...)):~%")
+  (format t "марк v0.5 — инструменты (вызывай как в лиспе: (имя ...)):~%")
   (dolist (t* *tools*)
     (format t "  (~a ...) — ~a~%" (first t*) (second t*)))
-  (format t "просто болтай — марк сам учится. поправка после догадки: правильно: ответ~%"))
+  (format t "просто болтай — марк сам учится. поправка после догадки: правильно: ответ~%")
+  (format t "оценка ответа: + (сработало, закрепить) или - (не сработало, выбросить)~%"))
 
 (defun run-tool (name args)
   (let ((tool (find name *tools* :key #'first :test #'string-equal)))
@@ -557,6 +608,10 @@ learn=nil — не впитывать в корпус (для selfchat, чтоб
     (cond
       ((string-equal l "exit") :exit)
       ((string-equal l "help") (help) nil)
+      ((or (string-equal l "+") (string-equal l "плюс"))
+       (praise) nil)
+      ((or (string-equal l "-") (string-equal l "минус"))
+       (criticize) nil)
       ((uiop:string-prefix-p "(" l)
        ;; лисповская форма: (имя аргументы...)
        (handler-case
