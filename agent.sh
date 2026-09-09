@@ -7,6 +7,7 @@ sbcl --script /dev/stdin <<EOF
 (load-memory)
 (load-macros)
 (load-codes)
+(load-personas)
 (format t "~%=== марк-агент стартует ===~%")
 (agent-run "$GOAL")
 (format t "~%=== журнал действий: ===~%")

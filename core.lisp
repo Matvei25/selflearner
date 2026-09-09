@@ -4,6 +4,7 @@
 (require :asdf)
 
 (defvar *memory-file* (merge-pathnames "memory.lisp" *load-pathname*))
+(defvar *self-dir* (uiop:pathname-directory-pathname *load-pathname*))
 (defvar *markov-script* (merge-pathnames "markov.py" *load-pathname*))
 (defvar *memory* '())        ; ((вопрос ответ уверенность) ...)
 (defvar *guess-count* 0)
@@ -11,6 +12,12 @@
 (defvar *temperature* 1.2)   ; температура генерации маркова (>1 — разнообразнее)
 (defvar *macros* '())        ; ((имя (параметры...) шаблон [auto]) ...) — объявлено заранее
 (defvar *codes* '())         ; ((имя (аргументы...) "тело") ...) — объявлено заранее
+
+;; ---------- персона (v0.9: марк становится персонажем) ----------
+(defvar *personas* '())          ; реестр: ((имя (характер...)) ...)
+(defvar *persona* nil)           ; имя активной персоны или nil
+(defvar *persona-memory* '())    ; память активной персоны (вопрос ответ вызов уверенность)
+(defvar *personas-file* (merge-pathnames "persons.lisp" *load-pathname*))
 
 (defparameter *stop-words*
   '("что" "как" "это" "а" "ну" "и" "в" "на" "по" "не" "я" "ты" "он" "она" "они" "мы" "вы" "то" "да" "нет" "у" "о" "же"
@@ -61,6 +68,12 @@
           (let ((*print-case* :downcase) (*print-pretty* t))
             (prin1 *memory* out)))))))
 
+(defun persist-memory ()
+  "сохранить память туда, где она сейчас живёт (персона или общая)"
+  (if *persona*
+      (persona-save-memory *persona*)
+      (save-memory)))
+
 ;; ---------- утилиты ----------
 
 (defun normalize (text)
@@ -77,10 +90,10 @@
 
 ;; ---------- ИНСТРУМЕНТЫ ----------
 
-(defun recall (q)
-  "найти лучший ответ по пересечению слов (возвращает запись или nil)"
+(defun recall-in (q mem)
+  "найти лучший ответ по пересечению слов в конкретном списке (запись или nil)"
   (let ((qw (or (words q) (words-all q))) (best nil) (best-score 0))
-    (dolist (entry *memory*)
+    (dolist (entry mem)
       ;; пропускаем самоповторы (вопрос => тот же вопрос) — мусор от догадок
       (unless (string-equal (first entry) (second entry))
         (let* ((mw (words (first entry)))
@@ -92,23 +105,41 @@
             (setf best entry best-score score)))))
     (when (and best (>= best-score 1)) best)))
 
+(defun recall (q)
+  "найти лучший ответ: сначала в памяти персоны (если есть), потом в общей"
+  (or (recall-in q *persona-memory*)
+      (recall-in q *memory*)))
+
 (defun remember (q a &optional (conf 1.0) (verbose t))
-  "запомнить пару (перезаписывает тот же вопрос)"
+  "запомнить пару (перезаписывает тот же вопрос). если активна персона — в её память"
   (let ((norm (normalize q)))
-    (setf *memory*
-          (cons (list q a nil conf)
-                (remove-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))))
-  (save-memory)
+    (if *persona*
+        (progn
+          (setf *persona-memory*
+                (cons (list q a nil conf)
+                      (remove-if (lambda (e) (string= (normalize (first e)) norm)) *persona-memory*)))
+          (persona-save-memory *persona*))
+        (progn
+          (setf *memory*
+                (cons (list q a nil conf)
+                      (remove-if (lambda (e) (string= (normalize (first e)) norm)) *memory*)))
+          (save-memory))))
   (when verbose
     (format t "запомнил: ~a => ~a~%" q a)))
 
 (defun forget (q)
-  (let ((norm (normalize q))
-        (before (length *memory*)))
-    (setf *memory* (remove-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))
-    (save-memory)
-    (format t "забыл ~a записей~%"
-            (- before (length *memory*)))))
+  (let ((norm (normalize q)))
+    (if *persona*
+        (let ((before (length *persona-memory*)))
+          (setf *persona-memory*
+                (remove-if (lambda (e) (string= (normalize (first e)) norm)) *persona-memory*))
+          (persona-save-memory *persona*)
+          (format t "забыл ~a записей~%" (- before (length *persona-memory*))))
+        (let ((before (length *memory*)))
+          (setf *memory*
+                (remove-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))
+          (save-memory)
+          (format t "забыл ~a записей~%" (- before (length *memory*)))))))
 
 ;; ---------- v0.5: обратная связь + / - ----------
 
@@ -116,10 +147,11 @@
 (defvar *critic-count* 0)
 
 (defun current-entry ()
-  "найти запись, которую марк использовал последней (по *last-q*)"
+  "найти запись, которую марк использовал последней (по *last-q*) — в персоне и в общей"
   (when *last-q*
     (let ((norm (normalize *last-q*)))
-      (find-if (lambda (e) (string= (normalize (first e)) norm)) *memory*))))
+      (or (find-if (lambda (e) (string= (normalize (first e)) norm)) *persona-memory*)
+          (find-if (lambda (e) (string= (normalize (first e)) norm)) *memory*)))))
 
 (defun praise ()
   "плюс: ответ сработал — закрепить запись (уверенность -> 1.0)"
@@ -130,7 +162,7 @@
       (t
        (setf (fourth entry) 1.0)
        (incf *praise-count*)
-       (save-memory)
+       (persist-memory)
        (format t "👍 запомнил, что сработало: ~a => ~a [точно]~%"
                (first entry) (second entry))))))
 
@@ -149,16 +181,20 @@
       (t
        (setf (fourth entry) 0.2)
        (incf *critic-count*)
-       (save-memory)
+       (persist-memory)
        (format t "👎 понизил уверенность: ~a => ~a [догадка]~%"
                (first entry) (second entry))))))
 
 (defun improvise (&optional (seed "ага"))
-  "сгенерировать текст марковской цепью (с температурой)"
-  (let ((out (uiop:run-program (list "python3" (namestring *markov-script*) "generate"
-                                    seed (format nil "~a" *temperature*))
-                               :output :string :ignore-error-status t)))
-    (if (uiop:emptyp out) "..." (string-trim '(#\Newline #\Space) out))))
+  "сгенерировать текст марковской цепью (с температурой).
+если активна персона — генерирует в её духе из её корпуса"
+  (let ((args (if *persona*
+                  (list "python3" (namestring *markov-script*) "persona-generate"
+                        *persona* (or seed "ага") (format nil "~a" *temperature*))
+                  (list "python3" (namestring *markov-script*) "generate"
+                        (or seed "ага") (format nil "~a" *temperature*)))))
+    (let ((out (uiop:run-program args :output :string :ignore-error-status t)))
+      (if (uiop:emptyp out) "..." (string-trim '(#\Newline #\Space) out)))))
 
 (defun absorb (text)
   "впитать текст в корпус — учится на всём, что слышит"
@@ -219,14 +255,20 @@
     ("status"    "состояние агента"                           agent-status)
     ("log"       "журнал действий агента"                    agent-log-show)
     ("stop"      "остановить агента"                          agent-stop)
+    ("персона"         "включить/показать/снять персону: (персона имя|[ничего]|-)" persona-cmd)
+    ("персона-define"  "определить персону: (персона-define имя характер...)" persona-define)
+    ("персоны"         "список персон"                         persona-list)
+    ("персона-учить"   "впитать фразу в персону: (персона-учить текст)" persona-teach)
+    ("персона-реплика" "сгенерить в духе персоны: (персона-реплика [слово])" persona-speak)
     ("help"      "справка по инструментам"                   help)))
 
 (defun help ()
-  (format t "марк v0.5 — инструменты (вызывай как в лиспе: (имя ...)):~%")
+  (format t "марк v0.9 — инструменты (вызывай как в лиспе: (имя ...)):~%")
   (dolist (t* *tools*)
     (format t "  (~a ...) — ~a~%" (first t*) (second t*)))
   (format t "просто болтай — марк сам учится. поправка после догадки: правильно: ответ~%")
-  (format t "оценка ответа: + (сработало, закрепить) или - (не сработало, выбросить)~%"))
+  (format t "оценка ответа: + (сработало, закрепить) или - (не сработало, выбросить)~%")
+  (format t "персона: (персона имя) включить, (персона) показать, (персона -) снять — марк говорит в её духе~%"))
 
 (defun run-tool (name args)
   (let ((tool (find name *tools* :key #'first :test #'string-equal)))
@@ -293,7 +335,10 @@
     ("умеешь" "help")
     ("что умеешь" "help")
     ("помощь" "help")
-    ("инструменты" "help")))
+    ("инструменты" "help")
+    ("стань" "персона")
+    ("кем ты" "персона")
+    ("включи персону" "персона")))
 
 (defun detect-tool (text)
   "самостоятельный выбор инструмента по ключевым словам -> (name args) или nil"
@@ -598,6 +643,123 @@
 (defun agent-stop ()
   (setf *agent-plan* '() *agent-busy* nil)
   (format t "агент остановлен~%"))
+
+;; ---------- ПЕРСОНЫ (марк становится персонажем) ----------
+
+(defun load-personas ()
+  (setf *personas* '())
+  (when (probe-file *personas-file*)
+    (handler-case
+        (with-open-file (in *personas-file* :direction :input)
+          (loop for form = (read in nil :eof)
+                until (eq form :eof)
+                do (when (listp form) (setf *personas* (append *personas* form)))))
+      (error () nil))))
+
+(defun save-personas ()
+  (with-open-file (out *personas-file* :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+    (with-standard-io-syntax
+      (let ((*print-case* :downcase) (*print-pretty* t))
+        (prin1 *personas* out)))))
+
+(defun person-memory-file (name)
+  (merge-pathnames (format nil "memory_~a.lisp"
+                           (string-downcase (string-trim " " name)))
+                   *self-dir*))
+
+(defun persona-load-memory (name)
+  (let ((f (person-memory-file name)))
+    (setf *persona-memory* '())
+    (when (probe-file f)
+      (handler-case
+          (with-open-file (in f :direction :input)
+            (loop for form = (read in nil :eof)
+                  until (eq form :eof)
+                  do (when (listp form) (setf *persona-memory* (append *persona-memory* form)))))
+        (error () nil)))
+    ;; миграция 2/3 -> 4 (вопрос ответ вызов уверенность)
+    (setf *persona-memory*
+          (mapcar (lambda (e)
+                    (cond ((= (length e) 2) (list (first e) (second e) nil 1.0))
+                          ((= (length e) 3) (list (first e) (second e) nil (third e)))
+                          (t e)))
+                  *persona-memory*))))
+
+(defun persona-save-memory (name)
+  (with-open-file (out (person-memory-file name) :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+    (with-standard-io-syntax
+      (let ((*print-case* :downcase) (*print-pretty* t))
+        (prin1 *persona-memory* out)))))
+
+(defun find-persona (name)
+  (assoc name *personas* :test #'string-equal))
+
+(defun persona-define (name &rest traits)
+  "определить/перезаписать персону: (персона-define имя [характер ...])"
+  (let ((n (string-downcase (string-trim " " name))))
+    (setf *personas*
+          (cons (list n (mapcar #'string-downcase traits))
+                (remove-if (lambda (p) (string-equal (first p) n)) *personas*)))
+    (save-personas)
+    (format t "персона ~a определена: ~{~a~^, ~}~%" n traits)))
+
+(defun persona-set (name)
+  "активировать персону (загрузить её память). нет такой — создаст пустую"
+  (let ((n (string-downcase (string-trim " " name))))
+    (when *persona* (persona-save-memory *persona*))
+    (unless (find-persona n) (persona-define n))
+    (setf *persona* n)
+    (persona-load-memory n)
+    (format t "персона: ~a (помнит ~a пар)~%" n (length *persona-memory*))))
+
+(defun persona-clear ()
+  (when *persona* (persona-save-memory *persona*))
+  (setf *persona* nil *persona-memory* '())
+  (format t "персона снята~%"))
+
+(defun persona-current ()
+  (if *persona*
+      (let ((p (find-persona *persona*)))
+        (format t "активна персона: ~a" *persona*)
+        (when (and p (second p)) (format t " (~{~a~^, ~})" (second p)))
+        (format t "~%помнит ~a пар.~%память:~%" (length *persona-memory*))
+        (dolist (e *persona-memory*)
+          (format t "  ~a => ~a [~a]~%" (first e) (second e)
+                  (if (>= (fourth e) 0.9) "точно"
+                      (if (>= (fourth e) 0.5) "почти" "догадка")))))
+      (format t "персона не задана~%")))
+
+(defun persona-list ()
+  (if (null *personas*)
+      (format t "персон нет. (персона-define имя характер)~%")
+      (dolist (p *personas*)
+        (format t "~a~@[ (~{~a~^, ~})~]~%" (first p) (second p)))))
+
+(defun persona-teach (text)
+  "научить активную персону фразе (в её корпус). пример: (персона-учить привет дружище)"
+  (uiop:run-program (list "python3" (namestring *markov-script*) "persona-learn"
+                          (or *persona* "никто") text)
+                    :output :string :ignore-error-status t)
+  (format t "персона ~a впитала фразу~%" (or *persona* "никто")))
+
+(defun persona-speak (&optional (seed "ага"))
+  "сгенерировать реплику в духе активной персоны (из её корпуса)"
+  (let ((out (uiop:run-program (list "python3" (namestring *markov-script*)
+                                     "persona-generate" (or *persona* "никто")
+                                     (or seed "ага") (format nil "~a" *temperature*))
+                               :output :string :ignore-error-status t)))
+    (if (uiop:emptyp out) "..." (string-trim '(#\Newline #\Space) out))))
+
+(defun persona-cmd (args)
+  "обработать (персона ...): пусто — показать текущую; -/none — снять; иначе — включить"
+  (let ((a (string-trim " " (or args ""))))
+    (cond
+      ((string= a "") (persona-current))
+      ((or (string-equal a "-") (string-equal a "none") (string-equal a "снять"))
+       (persona-clear))
+      (t (persona-set a)))))
 
 ;; ---------- обработка сообщения ----------
 

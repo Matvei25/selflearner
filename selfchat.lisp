@@ -9,6 +9,7 @@
 (load-memory)
 (load-macros)
 (load-codes)
+(load-personas)
 
 (defun rand-word (text)
   "случайное первое слово из текста (для seed генератора), без стоп-слов"

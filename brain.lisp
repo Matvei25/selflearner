@@ -8,8 +8,9 @@
 (load-memory)
 (load-macros)
 (load-codes)
+(load-personas)
 
-(format t "марк v0.5 — учусь сам. !help — инструменты.~%")
+(format t "марк v0.9 — учусь сам. !help — инструменты. (персона имя) — включить персонажа.~%")
 
 (loop for line = (read-line *standard-input* nil nil) while line do
   (let ((l (string-trim '(#\Newline #\Space) line)))
