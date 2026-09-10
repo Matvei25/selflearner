@@ -1,0 +1,7 @@
+# рабочий мусор Марка — не в git
+corpus_*.txt
+memory_*.lisp
+persons.lisp
+rules.lisp
+*.fasl
+web/__pycache__/
