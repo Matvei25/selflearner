@@ -260,6 +260,9 @@
     ("персоны"         "список персон"                         persona-list)
     ("персона-учить"   "впитать фразу в персону: (персона-учить текст)" persona-teach)
     ("персона-реплика" "сгенерить в духе персоны: (персона-реплика [слово])" persona-speak)
+    ("правила"   "кто жив, кто умер: (правила)"               rules-show)
+    ("эволюция"  "суд поколения прямо сейчас: (эволюция)"      evolve-rules)
+    ("воскресить" "вернуть мёртвое правило: (воскресить имя)"  rule-revive)
     ("help"      "справка по инструментам"                   help)))
 
 (defun help ()
@@ -268,7 +271,8 @@
     (format t "  (~a ...) — ~a~%" (first t*) (second t*)))
   (format t "просто болтай — марк сам учится. поправка после догадки: правильно: ответ~%")
   (format t "оценка ответа: + (сработало, закрепить) или - (не сработало, выбросить)~%")
-  (format t "персона: (персона имя) включить, (персона) показать, (персона -) снять — марк говорит в её духе~%"))
+  (format t "персона: (персона имя) включить, (персона) показать, (персона -) снять — марк говорит в её духе~%")
+  (format t "правила живут и умирают: (правила) — кто жив, (эволюция) — суд, (воскресить имя) — вернуть~%"))
 
 (defun run-tool (name args)
   (let ((tool (find name *tools* :key #'first :test #'string-equal)))
@@ -314,6 +318,7 @@
                                    (uiop:split-string rest :separator '(#\Space))))))
             ((eq fn 'macro-forget) (macro-forget args))
             ((eq fn 'agent-run) (agent-run args))
+            ((eq fn 'rule-revive) (rule-revive args))
             (t (funcall fn))))
         (format t "нет такого инструмента. !help~%"))))
 
@@ -344,8 +349,9 @@
   "самостоятельный выбор инструмента по ключевым словам -> (name args) или nil"
   (let ((norm (normalize text)))
     (dolist (rule *tool-rules* nil)
-      (let ((pos (search (first rule) norm)))
+      (let ((pos (and (rule-alive-p "инструмент" (first rule)) (search (first rule) norm))))
         (when pos
+          (rule-touch "инструмент" (first rule))
           (return-from detect-tool
             (list (second rule)
                   (string-trim " " (subseq norm (+ pos (length (first rule))))))))))))
@@ -427,13 +433,162 @@
   "элиза-рефлексы: найти правило, отзеркалить хвост фразы. nil если не сработало"
   (let ((norm (normalize text)))
     (dolist (rule *eliza-rules* nil)
-      (let ((pos (search (first rule) norm)))
+      (let ((pos (and (rule-alive-p "элиза" (first rule)) (search (first rule) norm))))
         (when pos
+          (rule-touch "элиза" (first rule))
           (let ((tail (string-trim " " (subseq norm (+ pos (length (first rule)))))))
             (return-from eliza-reply
               (if (string= tail "")
                   (second rule)  ; правило без хвоста — без подстановки
                   (format nil (second rule) (mirror tail))))))))))
+
+
+;; ---------- ПРАВИЛА: ЖИЗНЬ И СМЕРТЬ (v0.7) ----------
+;; у каждого правила есть здоровье: сработало — растёт, не срабатывало за поколение — падает.
+;; на нуле правило умирает (перестаёт применяться), но его можно воскресить.
+
+(defvar *rules-file* (merge-pathnames "rules.lisp" *self-dir*))
+(defvar *rule-stat* '())        ; (((вид имя) за-поколение здоровье всего) ...)
+(defvar *generation* 1)
+(defvar *epoch-ticks* 0)
+(defparameter *epoch-size* 20)      ; сколько услышанных реплик = одно поколение
+(defparameter *rule-max-hp* 3.0)
+(defparameter *rule-reward* 0.5)
+(defparameter *rule-decay* 1.0)
+
+(defun rule-key (kind name)
+  (list (string-downcase (format nil "~a" kind))
+        (string-downcase (format nil "~a" name))))
+
+(defun rule-entry (kind name)
+  (assoc (rule-key kind name) *rule-stat* :test #'equal))
+
+(defun rule-register (kind name)
+  "рождение: правило попадает в реестр, если его там ещё нет"
+  (or (rule-entry kind name)
+      (car (push (list (rule-key kind name) 0 (coerce *rule-max-hp* 'float) 0)
+                 *rule-stat*))))
+
+(defun rule-alive-p (kind name)
+  (let ((e (rule-entry kind name)))
+    (or (null e) (> (third e) 0))))
+
+(defun rule-older-p (a b)
+  (string< (format nil "~a/~a" (first (first a)) (second (first a)))
+           (format nil "~a/~a" (first (first b)) (second (first b)))))
+
+(defun rule-touch (kind name)
+  "правило сработало — счётчик и здоровье вверх"
+  (let ((e (rule-register kind name)))
+    (incf (second e))
+    (incf (fourth e))
+    (setf (third e) (min (coerce *rule-max-hp* 'float)
+                         (+ (third e) *rule-reward*)))))
+
+(defun save-rules ()
+  (handler-case
+      (with-open-file (out *rules-file* :direction :output
+                                       :if-exists :supersede
+                                       :if-does-not-exist :create)
+        (format out ";; правила марка — здоровье и статистика (его жизнь)~%(~%")
+        (dolist (e *rule-stat*)
+          (format out " (~s ~a ~,2f ~a)~%" (first e) (second e) (third e) (fourth e)))
+        (format out " (generation ~a))~%" *generation*))
+    (error (e) (format t "~~ не смог сохранить правила: ~a~%" e))))
+
+(defun load-rules ()
+  (when (probe-file *rules-file*)
+    (handler-case
+        (with-open-file (in *rules-file*)
+          (let ((data (read in nil nil)))
+            (when (listp data)
+              (setf *rule-stat*
+                    (loop for item in data
+                          when (and (listp item) (listp (first item)))
+                            collect (list (first item) (second item)
+                                          (coerce (third item) 'float) (fourth item))))
+              (dolist (item data)
+                (when (and (listp item) (eq (first item) 'generation))
+                  (setf *generation* (second item)))))))
+      (error (e) (format t "~~ не смог прочитать правила: ~a~%" e)))))
+
+(defun evolve-rules (&optional (verbose t))
+  "суд поколения: чем не пользовались — теряет здоровье, на нуле умирает"
+  (let ((died '()) (survived 0))
+    (dolist (e *rule-stat*)
+      (if (> (second e) 0)
+          (progn
+            (incf survived)
+            (setf (third e) (min (coerce *rule-max-hp* 'float)
+                                 (+ (third e) *rule-reward*))))
+          (progn
+            (decf (third e) *rule-decay*)
+            (when (<= (third e) 0)
+              (setf (third e) 0.0)
+              (push (second (first e)) died))))
+      (setf (second e) 0))
+    (setf *epoch-ticks* 0)
+    (incf *generation*)
+    (save-rules)
+    (when verbose
+      (format t "поколение ~a: выжило ~a, умерло ~a~@[ — ~{~a~^, ~}~]~%"
+              *generation* survived (length died) (reverse died)))
+    (values)))
+
+(defun rules-show ()
+  (if (null *rule-stat*)
+      (format t "правил в реестре нет~%")
+      (progn
+        (format t "правила — поколение ~a, до суда ещё ~a реплик~%"
+                *generation* (max 0 (- *epoch-size* *epoch-ticks*)))
+        (let ((live 0) (dead 0))
+          (dolist (e (sort (copy-list *rule-stat*) #'rule-older-p))
+            (let ((kind (first (first e)))
+                  (name (second (first e)))
+                  (hp (third e))
+                  (total (fourth e)))
+              (if (<= hp 0)
+                  (progn
+                    (incf dead)
+                    (format t "  ☠ ~a/~a — мертво (срабатывало ~a раз)~%" kind name total))
+                  (progn
+                    (incf live)
+                    (format t "  ~a ~a/~a — здоровье ~,1f, срабатывало ~a~%"
+                            (if (>= hp *rule-max-hp*) "живо" "слабо") kind name hp total)))))
+          (format t "живых: ~a, мёртвых: ~a. воскресить: (воскресить имя)~%" live dead)))))
+
+(defun rule-revive (args)
+  "вернуть мёртвое правило к жизни: (воскресить имя)"
+  (let ((name (string-downcase (string-trim " " (format nil "~a" (or args ""))))))
+    (if (uiop:emptyp name)
+        (format t "формат: (воскресить имя-правила)~%")
+        (let ((found '()))
+          (dolist (e *rule-stat*)
+            (when (string= (second (first e)) name)
+              (setf (third e) (coerce *rule-max-hp* 'float))
+              (setf (second e) 1)
+              (push (first (first e)) found)))
+          (if found
+              (progn
+                (save-rules)
+                (format t "воскресил ~{~a~^, ~} — здоровье ~a~%" found *rule-max-hp*))
+              (format t "нет правила с именем ~a~%" name))))))
+
+(defun rule-tick ()
+  "каждая услышанная реплика — тик; на границе поколения суд"
+  (incf *epoch-ticks*)
+  (when (>= *epoch-ticks* *epoch-size*)
+    (evolve-rules t))
+  (when (zerop (mod *epoch-ticks* 5))
+    (save-rules)))
+
+(defun rule-seed ()
+  "внести встроенные правила в реестр"
+  (dolist (r *eliza-rules*) (rule-register "элиза" (first r)))
+  (dolist (r *tool-rules*) (rule-register "инструмент" (first r))))
+
+(load-rules)
+(rule-seed)
 
 ;; ---------- МАКРОСЫ ----------
 
@@ -795,6 +950,8 @@ learn=nil — не впитывать в корпус (для selfchat, чтоб
            (format t "нечего исправлять~%"))
        nil)
       (t
+       ;; каждая реплика — тик жизни правил (v0.7)
+       (rule-tick)
        ;; самостоятельный выбор инструмента по ключевым словам
        (let ((tool (detect-tool l)))
          (if tool
