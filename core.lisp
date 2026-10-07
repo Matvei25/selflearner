@@ -201,14 +201,76 @@
   (uiop:run-program (list "python3" (namestring *markov-script*) "learn" text)
                     :output :string :ignore-error-status t))
 
-(defun dream ()
-  "пересборка памяти: убрать дубликаты"
-  (let ((before (length *memory*)))
-    (setf *memory* (remove-duplicates *memory*
-                                      :test (lambda (a b) (string= (normalize (first a)) (normalize (first b))))
-                                      :from-end t))
-    (save-memory)
-    (format t "приснилось: почистил ~a, осталось ~a~%" (- before (length *memory*)) (length *memory*))))
+;; ---------- v0.8: сны — ночная консолидация памяти ----------
+
+(defvar *since-dream* 0)              ; реплик с прошлого сна
+(defparameter *dream-every* 25)       ; раз в столько реплик Марк засыпает
+(defparameter *dream-junk-conf* 0.5)  ; догадки-пустышки ниже этой уверенности — в мусор
+(defparameter *dream-sim* 0.75)       ; схожесть вопросов для слияния (доля общих слов)
+
+(defun dream-junk-p (e)
+  "мусор: пустой/бессмысленный ответ, вопрос-эхо, или пустой вопрос"
+  (let ((q (first e)) (a (second e)) (c (or (fourth e) 0.0)))
+    (or (null a)
+        (string= a "")
+        (string-equal a "...")
+        (string-equal (normalize q) (normalize a))
+        (and (< c *dream-junk-conf*) (null (words q))))))
+
+(defun word-set (s)
+  (remove-duplicates (words s) :test #'string=))
+
+(defun word-jaccard (a b)
+  "доля общих слов из объединения (0..1)"
+  (let ((inter (intersection a b :test #'string=))
+        (un (union a b :test #'string=)))
+    (if (null un) 0.0 (/ (float (length inter)) (length un)))))
+
+(defun dream-merge-similar (mem)
+  "слить почти-дубли (схожесть >= *dream-sim*), оставив более уверенную запись"
+  (let ((out '()) (merged 0))
+    (dolist (e mem)
+      (let ((twin (find-if (lambda (o)
+                             (>= (word-jaccard (word-set (first o)) (word-set (first e)))
+                                 *dream-sim*))
+                           out)))
+        (cond
+          ((null twin) (push e out))
+          ((> (or (fourth e) 0.0) (or (fourth twin) 0.0))
+           (setf out (cons e (remove twin out)))   ; более уверенная вытесняет
+           (incf merged))
+          (t (incf merged)))))                      ; уже принятый twin сильнее — оставляем его
+    (values (nreverse out) merged)))
+
+(defun dream-dedup (mem)
+  "убрать точные дубли по нормализованному вопросу, оставив самый уверенный"
+  (let ((seen '()) (out '()))
+    (dolist (e mem)
+      (let* ((k (normalize (first e)))
+             (prev (assoc k seen :test #'string=)))
+        (cond
+          ((null prev) (push (cons k e) seen) (push e out))
+          ((> (or (fourth e) 0.0) (or (fourth (cdr prev)) 0.0))
+           (setf out (cons e (remove (cdr prev) out)))   ; вытесняем слабый дубль
+           (setf (cdr prev) e)))))
+    out))
+
+(defun dream (&optional (verbose t))
+  "v0.8 — ночная пересборка памяти: мусор вон, похожие вопросы сливаются,
+дубли схлопываются. чистит память активной персоны, если она есть, иначе общую"
+  (let* ((before (length (if *persona* *persona-memory* *memory*)))
+         (mem (remove-if #'dream-junk-p (if *persona* *persona-memory* *memory*)))
+         (junk (- before (length mem))))
+    (multiple-value-bind (mem2 merged) (dream-merge-similar mem)
+      (let ((clean (dream-dedup mem2)))
+        (if *persona*
+            (progn (setf *persona-memory* clean) (persona-save-memory *persona*))
+            (progn (setf *memory* clean) (save-memory)))
+        (setf *since-dream* 0)
+        (when verbose
+          (format t "🌙 снилось: мусора ~a · слито ~a · было ~a, стало ~a~%"
+                  junk merged before (length clean)))
+        (length clean)))))
 
 (defun stats ()
   (let ((guesses (count-if (lambda (e) (< (or (fourth e) 0.0) 0.9)) *memory*)))
@@ -238,7 +300,7 @@
     ("recall"    "поиск: (recall вопрос)"                    recall)
     ("improvise" "сгенерить: (improvise [слово])"            improvise)
     ("absorb"    "впитать текст: (absorb текст)"             absorb)
-    ("dream"     "пересобрать память"                        dream)
+    ("dream"     "ночная пересборка памяти (мусор вон, дубли вместе)"  dream)
     ("forget"    "забыть: (forget вопрос)"                   forget)
     ("stats"     "статистика"                                stats)
     ("memory"    "показать всю память"                       show-memory)
@@ -952,6 +1014,9 @@ learn=nil — не впитывать в корпус (для selfchat, чтоб
       (t
        ;; каждая реплика — тик жизни правил (v0.7)
        (rule-tick)
+       ;; v0.8: раз в *dream-every* реплик марк засыпает и пересобирает память
+       (incf *since-dream*)
+       (when (>= *since-dream* *dream-every*) (dream))
        ;; самостоятельный выбор инструмента по ключевым словам
        (let ((tool (detect-tool l)))
          (if tool
