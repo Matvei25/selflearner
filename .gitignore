@@ -4,4 +4,4 @@ memory_*.lisp
 persons.lisp
 rules.lisp
 *.fasl
-web/__pycache__/
+__pycache__/
