@@ -5,3 +5,5 @@ persons.lisp
 rules.lisp
 *.fasl
 __pycache__/
+out/
+agent-state.lisp

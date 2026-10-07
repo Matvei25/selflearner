@@ -9,6 +9,7 @@
 (load-macros)
 (load-codes)
 (load-personas)
+(load-agent-state)
 
 (format t "марк v0.9 — учусь сам. !help — инструменты. (персона имя) — включить персонажа.~%")
 

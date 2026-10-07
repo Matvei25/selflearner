@@ -9,6 +9,7 @@
 (load-macros)
 (load-codes)
 (load-personas)
+(load-agent-state)
 
 ;; экранируем переносы, чтобы ответ уместился в одну строку
 (defun esc (s)

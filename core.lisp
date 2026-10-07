@@ -9,7 +9,16 @@
 (defvar *memory* '())        ; ((вопрос ответ уверенность) ...)
 (defvar *guess-count* 0)
 (defvar *last-q* nil)        ; последний вопрос, чтобы поправка знала куда писать
-(defvar *temperature* 1.2)   ; температура генерации маркова (>1 — разнообразнее)
+(defvar *temperature* 1.2)   ; базовая температура генерации (>1 — разнообразнее)
+(defvar *creativity* t)                ; v1.0: вспышки креативности включены?
+(defparameter *temp-spike* 0.6)        ; насколько подскакивает температура во «вспышке»
+(defparameter *temp-spike-chance* 0.18) ; вероятность вспышки на одну генерацию
+
+(defun effective-temperature ()
+  "температура на этот вызов: иногда подскакивает — «вспышка креативности» (v1.0)"
+  (if (and *creativity* (< (random 1.0) *temp-spike-chance*))
+      (+ *temperature* *temp-spike*)
+      *temperature*))
 (defvar *macros* '())        ; ((имя (параметры...) шаблон [auto]) ...) — объявлено заранее
 (defvar *codes* '())         ; ((имя (аргументы...) "тело") ...) — объявлено заранее
 
@@ -190,9 +199,9 @@
 если активна персона — генерирует в её духе из её корпуса"
   (let ((args (if *persona*
                   (list "python3" (namestring *markov-script*) "persona-generate"
-                        *persona* (or seed "ага") (format nil "~a" *temperature*))
+                        *persona* (or seed "ага") (format nil "~a" (effective-temperature)))
                   (list "python3" (namestring *markov-script*) "generate"
-                        (or seed "ага") (format nil "~a" *temperature*)))))
+                        (or seed "ага") (format nil "~a" (effective-temperature))))))
     (let ((out (uiop:run-program args :output :string :ignore-error-status t)))
       (if (uiop:emptyp out) "..." (string-trim '(#\Newline #\Space) out)))))
 
@@ -295,6 +304,38 @@
         (progn (setf *temperature* v) (format t "температура: ~a~%" v))
         (format t "формат: !temp 1.5~%"))))
 
+(defun set-creativity (x)
+  "управление вспышками креативности: пусто — показать; вкл/on, выкл/off; число 0..1 — вероятность"
+  (let ((a (string-trim " " (or x ""))))
+    (cond
+      ((string= a "")
+       (format t "креативность: ~a (вероятность вспышки ~a, +~a к температуре)~%"
+               (if *creativity* "вкл" "выкл") *temp-spike-chance* *temp-spike*))
+      ((member a '("вкл" "on" "да") :test #'string-equal) (setf *creativity* t)
+       (format t "креативность: вкл~%"))
+      ((member a '("выкл" "off" "нет") :test #'string-equal) (setf *creativity* nil)
+       (format t "креативность: выкл~%"))
+      ((parse-number a) (setf *temp-spike-chance* (parse-number a))
+       (format t "вероятность вспышки: ~a~%" (parse-number a)))
+      (t (format t "формат: (креативность вкл/выкл/0.2)~%")))))
+
+(defvar *mark-fs-dir* (merge-pathnames "../mark-fs/" *self-dir*))
+(defvar *make-tree-dir* (namestring (merge-pathnames "out/" *self-dir*)))
+
+(defun make-tree (args)
+  "развернуть файловую структуру через mark-fs: (дерево запрос).
+мозг — лисп (mark-fs/core.lisp) выдаёт JSON, руки — python (fs_builder.py) создают файлы."
+  (let ((query (string-trim " " (or args ""))))
+    (if (uiop:emptyp query)
+        (format t "формат: (дерево что-сделать), напр. (дерево телеграм бот)~%")
+        (handler-case
+            (let ((out (uiop:run-program
+                        (list "bash" (namestring (merge-pathnames "fs_agent.sh" *mark-fs-dir*))
+                              query (namestring (merge-pathnames "out/" *self-dir*)))
+                        :output :string :ignore-error-status t)))
+              (format t "~a~%" (string-trim '(#\Newline #\Space) out)))
+          (error (e) (format t "mark-fs не отработал: ~a~%" e))))))
+
 (defparameter *tools*
   '(("remember"  "запомнить: (remember вопрос => ответ)"     remember)
     ("recall"    "поиск: (recall вопрос)"                    recall)
@@ -305,6 +346,10 @@
     ("stats"     "статистика"                                stats)
     ("memory"    "показать всю память"                       show-memory)
     ("temp"      "температура генерации: (temp 1.5)"         set-temp)
+    ("креативность" "вспышки креативности: (креативность вкл/выкл/0.2)" set-creativity)
+    ("дерево" "развернуть файловую структуру (mark-fs): (дерево запрос)" make-tree)
+    ("цели" "цели и журнал агента (с диска): (цели)" agent-log-show)
+    ("agent-clear" "стереть цели и журнал агента" agent-forget-state)
     ("macro"     "создать макрос: (macro имя (x) \"текст {x}\")" add-macro)
     ("macros"    "показать макросы"                           show-macros)
     ("run"       "выполнить макрос: (run имя аргументы)"     run-macro)
@@ -355,6 +400,8 @@
             ((eq fn 'absorb) (absorb args) (format t "впитал~%"))
             ((eq fn 'forget) (forget args))
             ((eq fn 'set-temp) (set-temp args))
+            ((eq fn 'set-creativity) (set-creativity args))
+            ((eq fn 'make-tree) (make-tree args))
             ((eq fn 'add-macro)
              (let* ((arrow (search "=>" args))
                     (sp (position #\Space args))
@@ -396,6 +443,12 @@
     ("сгенерируй" "improvise")
     ("придумай" "improvise")
     ("сочини" "improvise")
+    ("креативность" "креативность")
+    ("разверни проект" "дерево")
+    ("создай структуру" "дерево")
+    ("сделай дерево" "дерево")
+    ("создай проект" "дерево")
+    ("построй структуру" "дерево")
     ("почисти память" "dream")
     ("приберись" "dream")
     ("поспи" "dream")
@@ -798,10 +851,40 @@
 (defvar *agent-log* '())    ; журнал действий
 (defvar *agent-busy* nil)
 
+;; v1.0: АВТОНОМНОСТЬ — цели и журнал живут на диске между сессиями
+(defvar *agent-state-file* (merge-pathnames "agent-state.lisp" *self-dir*))
+
+(defun save-agent-state ()
+  "сохранить цели и журнал на диск (чтоб Марк помнил их между запусками)"
+  (handler-case
+      (with-open-file (out *agent-state-file* :direction :output :if-exists :supersede)
+        (with-standard-io-syntax
+          (let ((*print-case* :downcase) (*print-pretty* t))
+            (prin1 (list :goals *agent-goals* :log *agent-log*) out))))
+    (error (e) (format t "⚠ не сохранил состояние агента: ~a~%" e))))
+
+(defun load-agent-state ()
+  "загрузить цели и журнал с диска (зовётся при старте)"
+  (when (probe-file *agent-state-file*)
+    (handler-case
+        (with-open-file (in *agent-state-file*)
+          (let ((st (read in nil nil)))
+            (when (listp st)
+              (setf *agent-goals* (or (getf st :goals) '())
+                    *agent-log* (or (getf st :log) '())))))
+      (error (e) (format t "⚠ не прочитал состояние агента: ~a~%" e)))))
+
+(defun agent-forget-state ()
+  "стереть цели и журнал (и на диске)"
+  (setf *agent-goals* '() *agent-log* '())
+  (save-agent-state)
+  (format t "состояние агента стёрто~%"))
+
 (defun log-agent (fmt &rest args)
-  "записать действие в журнал и показать"
+  "записать действие в журнал, показать и сохранить на диск"
   (push (apply #'format nil fmt args) *agent-log*)
-  (format t "  [агент] ~a~%" (apply #'format nil fmt args)))
+  (format t "  [агент] ~a~%" (apply #'format nil fmt args))
+  (save-agent-state))
 
 (defun agent-think (goal)
   "ПЛАНИРОВЩИК: цель -> последовательность инструментов (эвристики по словам)"
@@ -859,6 +942,7 @@
 
 (defun agent-stop ()
   (setf *agent-plan* '() *agent-busy* nil)
+  (save-agent-state)
   (format t "агент остановлен~%"))
 
 ;; ---------- ПЕРСОНЫ (марк становится персонажем) ----------
@@ -965,7 +1049,7 @@
   "сгенерировать реплику в духе активной персоны (из её корпуса)"
   (let ((out (uiop:run-program (list "python3" (namestring *markov-script*)
                                      "persona-generate" (or *persona* "никто")
-                                     (or seed "ага") (format nil "~a" *temperature*))
+                                     (or seed "ага") (format nil "~a" (effective-temperature)))
                                :output :string :ignore-error-status t)))
     (if (uiop:emptyp out) "..." (string-trim '(#\Newline #\Space) out))))
 
